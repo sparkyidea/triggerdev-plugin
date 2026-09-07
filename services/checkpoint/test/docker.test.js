@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import http from "node:http";
 import test from "node:test";
 import {
   buildRestoreContainerSpec,
@@ -6,6 +7,28 @@ import {
   DockerClient,
   registryAuthHeader,
 } from "../src/docker.js";
+
+test("default fetch and dispatcher can call a real Docker HTTP endpoint", { timeout: 5000 }, async () => {
+  const server = http.createServer((request, response) => {
+    if (request.url === "/_ping") {
+      response.end("OK");
+    } else {
+      response.writeHead(404);
+      response.end();
+    }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  let client;
+  try {
+    client = new DockerClient({ baseUrl: `http://127.0.0.1:${server.address().port}` });
+    const response = await client.ping();
+    assert.equal(response.status, 200);
+    assert.equal(await response.text(), "OK");
+  } finally {
+    await client?.dispatcher?.close();
+    await new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+});
 
 test("passes the configured dispatcher to slow Docker API requests", async () => {
   const dispatcher = {};

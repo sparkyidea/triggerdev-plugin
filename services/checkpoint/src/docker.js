@@ -1,6 +1,7 @@
 import { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { Agent } from "undici";
+// Keep fetch and its dispatcher on the same Undici handler API version.
+import { Agent, fetch } from "undici";
 
 const DOCKER_HEADERS_TIMEOUT_MS = 30 * 60 * 1000;
 
