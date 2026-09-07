@@ -52,6 +52,8 @@ exited `runner-*` containers after a grace period.
 
 - Linux host (Ubuntu/Debian is the provided setup path)
 - Docker Engine with experimental features enabled
+- Docker 27.5.1 is the current same-host pilot candidate; Docker 28/29 are not
+  qualified. Passing a raw checkpoint test is not end-to-end Trigger validation.
 - CRIU installed and passing `criu check`
 - Trigger.dev webapp and supervisor pinned to v4.5.14
 - A dedicated ARM64 worker group whose every worker enables checkpoints
@@ -154,6 +156,26 @@ docker compose --env-file deploy/worker/orc-a1cpu1ram6/.env \
 
 The expected supervisor line is `Checkpoints enabled`.
 
+### Docker default-directory restore
+
+Docker rejects `checkpoint-dir` on container start, including on 27.5.1. Dumping
+to `CHECKPOINT_ROOT` is supported, but restore and source recovery first copy the
+CRIU image set into `<DockerRootDir>/containers/<full-container-id>/checkpoints/`.
+The service then starts with only `checkpoint=<staged-id>` and removes its own
+temporary staging copy. It never overwrites an existing checkpoint.
+
+Bind the host's `/var/lib/docker/containers` directory into the checkpoint service
+at the identical absolute path, read-write, with `create_host_path: false`. If
+Docker uses a custom data-root, mount that root's `containers` directory instead.
+Do not mount the whole Docker data-root or expose this mount to task runners.
+This is root-equivalent filesystem access, beyond the socket proxy's API controls.
+Missing/inaccessible container directories are rejected before a runner is frozen.
+
+Registry authentication uses padded URL-safe Base64, as required by Docker's
+`X-Registry-Auth` decoder. Valid registry credentials alone do not prove that this
+header is correctly encoded. The service health endpoint checks Docker connectivity,
+not registry/S3 permissions or full checkpoint/restore compatibility.
+
 ## End-to-end validation
 
 Deploy and trigger `checkpoint-validation-parent` from `trigger/checkpoint-validation.ts`.
@@ -174,6 +196,20 @@ Success requires all of the following:
 Task completion alone does not prove checkpointing because `triggerAndWait()` also works
 without a checkpoint backend. The suspend/remove/restore sequence and preserved marker are
 the proof.
+
+For an isolated service-path smoke test before a real Trigger run:
+
+```bash
+docker compose exec -e CHECKPOINT_SMOKE_CONFIRM=disposable-worker checkpoint \
+  node scripts/smoke-service.mjs
+```
+
+This creates a disposable Node HTTP process, checkpoints it through the real
+registry and S3, deletes the source, restores into a fresh container, and checks
+an in-memory UUID. It then injects an upload failure to verify same-process source
+recovery. Only the Trigger completion callback is mocked, so this does not replace
+the real parent/child validation. Successful tests remove their own containers,
+object archives and image tags; failures leave artifacts for diagnosis.
 
 ## Configuration
 
@@ -216,8 +252,11 @@ normal worker configuration.
   a safe read-only/offline window for the registry.
 - A service crash after Docker stops a runner but before the webapp callback is a difficult
   failure boundary. Jobs are persisted locally and recovered after restart, and the service
-  attempts to restart the source container when a checkpoint job fails, but this is not a
-  substitute for extensive failure testing.
+  attempts to restore the source process when a checkpoint job fails. If recovery
+  fails, it never substitutes a normal container start: that loses the in-memory
+  wait and can duplicate task effects. The failed job records `recoveryError` and
+  its source is excluded from automatic reaping until explicit run cleanup.
+  This is not a substitute for extensive failure testing.
 
 ## Development
 

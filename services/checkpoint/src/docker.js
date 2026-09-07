@@ -2,6 +2,7 @@ import { Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 // Keep fetch and its dispatcher on the same Undici handler API version.
 import { Agent, fetch } from "undici";
+import { checkpointContainerDirectory, withStagedCheckpoint } from "./checkpoint-files.js";
 
 const DOCKER_HEADERS_TIMEOUT_MS = 30 * 60 * 1000;
 
@@ -76,6 +77,9 @@ export class DockerClient {
   }
 
   async checkpointContainer(id, checkpointId, checkpointDir) {
+    // Refuse to freeze a process if this service cannot later stage its restore.
+    const [info, container] = await Promise.all([this.info(), this.inspectContainer(id)]);
+    await checkpointContainerDirectory(info.DockerRootDir, container.Id);
     await this.request(`/containers/${encodeURIComponent(id)}/checkpoints`, {
       method: "POST",
       body: { CheckpointID: checkpointId, CheckpointDir: checkpointDir, Exit: true },
@@ -90,8 +94,17 @@ export class DockerClient {
   }
 
   async startContainer(id, { checkpointId, checkpointDir } = {}) {
+    if (checkpointId && checkpointDir) {
+      const [info, container] = await Promise.all([this.info(), this.inspectContainer(id)]);
+      return withStagedCheckpoint({
+        dockerRootDir: info.DockerRootDir,
+        containerId: container.Id,
+        checkpointId,
+        checkpointDir,
+      }, (stagedId) => this.startContainer(container.Id, { checkpointId: stagedId }));
+    }
     const query = checkpointId
-      ? `?checkpoint=${encodeURIComponent(checkpointId)}&checkpoint-dir=${encodeURIComponent(checkpointDir)}`
+      ? `?checkpoint=${encodeURIComponent(checkpointId)}`
       : "";
     await this.request(`/containers/${encodeURIComponent(id)}/start${query}`, { method: "POST" });
   }
@@ -151,10 +164,11 @@ export class DockerClient {
 
 export function registryAuthHeader({ username, password, serverAddress }) {
   if (!username && !password && !serverAddress) return undefined;
+  // Go's base64.URLEncoding requires padding; Node's base64url removes it.
   return Buffer.from(
     JSON.stringify({ username, password, serveraddress: serverAddress }),
     "utf8"
-  ).toString("base64url");
+  ).toString("base64").replace(/\+/g, "-").replace(/\//g, "_");
 }
 
 export function buildRestoreContainerSpec(inspect, imageRef, labels = {}) {

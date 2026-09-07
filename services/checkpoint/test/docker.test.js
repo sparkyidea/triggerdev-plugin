@@ -107,3 +107,32 @@ test("encodes Docker registry auth", () => {
     serveraddress: "r.test",
   });
 });
+
+test("registry auth retains Go-compatible padding for every payload length", () => {
+  for (const password of ["p", "pp", "ppp", "secret-🔑"]) {
+    const auth = { username: "u", password, serverAddress: "registry.test" };
+    const value = registryAuthHeader(auth);
+    assert.equal(value.length % 4, 0);
+    assert.match(value, /^[A-Za-z0-9_-]+={0,2}$/);
+    assert.equal(value, Buffer.from(JSON.stringify({
+      username: auth.username, password, serveraddress: auth.serverAddress,
+    })).toString("base64").replace(/\+/g, "-").replace(/\//g, "_"));
+  }
+});
+
+test("default-directory restore never sends checkpoint-dir, even as undefined", async () => {
+  const urls = [];
+  const client = new DockerClient({
+    baseUrl: "http://docker.test",
+    fetchImpl: async (url) => {
+      urls.push(url);
+      return new Response(null, { status: 204 });
+    },
+  });
+  await client.startContainer("runner", { checkpointId: "checkpoint-1" });
+  await client.startContainer("runner");
+  assert.deepEqual(urls, [
+    "http://docker.test/containers/runner/start?checkpoint=checkpoint-1",
+    "http://docker.test/containers/runner/start",
+  ]);
+});

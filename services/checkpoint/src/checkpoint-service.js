@@ -265,12 +265,13 @@ export class CheckpointService {
         state: job.state,
         error: message,
       });
-      await this.recoverSourceRunner(job).catch((recoveryError) =>
+      await this.recoverSourceRunner(job).catch((recoveryError) => {
+        job.recoveryError = errorMessage(recoveryError);
         log("error", "Failed to recover source runner", {
           runFriendlyId: job.runFriendlyId,
-          error: errorMessage(recoveryError),
-        })
-      );
+          error: job.recoveryError,
+        });
+      });
       await this.submitSuspendCompletion(job, { success: false, error: message }).catch(() => {});
       job.state = "failed";
       job.error = message;
@@ -427,14 +428,12 @@ export class CheckpointService {
       } catch (error) {
         const refreshed = await this.docker.inspectContainerOrNull(job.body.runnerId);
         if (refreshed?.State?.Running) return;
-        log("error", "Checkpoint recovery failed; falling back to a normal runner start", {
-          runFriendlyId: job.runFriendlyId,
-          runnerId: job.body.runnerId,
-          error: errorMessage(error),
-        });
+        // Starting normally loses the waiting process and attempts to execute an
+        // already-started snapshot. Preserve the source and report the failure.
+        throw error;
       }
     }
-    await this.docker.startContainer(job.body.runnerId);
+    throw new Error("No recoverable checkpoint exists; refusing to cold-start the source runner");
   }
 
   async submitSuspendCompletion(job, body) {
@@ -542,7 +541,7 @@ export class CheckpointService {
     const containers = await this.docker.listExitedRunnerContainers();
     const protectedRunners = new Set(
       [...this.jobs.values()]
-        .filter((job) => !TERMINAL_JOB_STATES.has(job.state))
+        .filter((job) => !TERMINAL_JOB_STATES.has(job.state) || job.recoveryError)
         .map((job) => job.body.runnerId)
     );
     const cutoff = Date.now() - this.config.reaper.graceSeconds * 1000;

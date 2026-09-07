@@ -16,6 +16,7 @@ ENV NODE_ENV=production
 COPY --from=dependencies /app/node_modules ./node_modules
 COPY package.json ./
 COPY src ./src
+COPY scripts ./scripts
 
 # dockerd/runc creates CRIU output below CHECKPOINT_ROOT as root with mode 0700.
 # Docker API access is already root-equivalent and is constrained by the proxy.

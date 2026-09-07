@@ -287,7 +287,7 @@ test("reaper uses exit time and protects runners with in-flight checkpoint jobs"
   assert.deepEqual(removed, ["old-id"]);
 });
 
-test("falls back to a normal start when checkpoint recovery fails", async () => {
+test("never cold-starts a runner when checkpoint recovery fails", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "trigger-checkpoint-test-"));
   const config = testConfig(root);
   const docker = createFakeDocker();
@@ -314,10 +314,34 @@ test("falls back to a normal start when checkpoint recovery fails", async () => 
     recursive: true,
   });
 
-  await service.recoverSourceRunner(job);
-  assert.equal(starts.length, 2);
+  await assert.rejects(service.recoverSourceRunner(job), /partial checkpoint/);
+  assert.equal(starts.length, 1);
   assert.equal(starts[0][1].checkpointId, job.checkpointId);
-  assert.equal(starts[1][1], undefined);
+});
+
+test("never cold-starts a stopped source with missing checkpoint files", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "trigger-checkpoint-test-"));
+  const docker = createFakeDocker();
+  docker.inspectContainerOrNull = async () => ({ State: { Running: false } });
+  const service = new CheckpointService({ config: testConfig(root), docker });
+  await assert.rejects(service.recoverSourceRunner({
+    state: "checkpointed", runFriendlyId: "run_missing", snapshotFriendlyId: "snapshot_1",
+    checkpointId: "checkpoint-1", body: { runnerId: "runner-missing" },
+  }), /refusing to cold-start/);
+  assert.equal(docker.calls.some(([op]) => op === "start"), false);
+});
+
+test("reaper preserves failed recovery sources for manual recovery", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "trigger-checkpoint-test-"));
+  const docker = createFakeDocker();
+  docker.listExitedRunnerContainers = async () => [{ Id: "source", Names: ["/runner-failed"] }];
+  docker.inspectContainerOrNull = async () => ({ State: { FinishedAt: "2020-01-01T00:00:00Z" } });
+  const service = new CheckpointService({ config: testConfig(root), docker });
+  service.jobs.set("run_failed:snapshot_1", {
+    state: "failed", recoveryError: "restore failed", body: { runnerId: "runner-failed" },
+  });
+  await service.reapExitedRunners();
+  assert.equal(docker.calls.some(([op]) => op === "remove"), false);
 });
 
 test("restore shares the suspend queue concurrency limit", async () => {
