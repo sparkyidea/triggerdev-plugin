@@ -1,0 +1,20 @@
+{
+  "name": "trigger-checkpoint-service",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Experimental Docker/CRIU checkpoint service for self-hosted Trigger.dev V2 workers",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node --test",
+    "check": "node --check src/index.js && node --check src/checkpoint-service.js && node --check src/docker.js && node --check src/queue.js && node --check src/server.js && node --check src/storage.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "3.1127.0",
+    "@aws-sdk/lib-storage": "3.1127.0",
+    "undici": "8.10.2"
+  }
+}
