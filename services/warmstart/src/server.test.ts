@@ -451,7 +451,8 @@ describe("validation and telemetry", () => {
       });
       const exited = once(child, "exit");
       try {
-        await until(() => output.includes('"event":"listening"'));
+        // Node startup can exceed 3s under QEMU-emulated multi-arch CI builds.
+        await until(() => output.includes('"event":"listening"'), 30_000);
         const line = output
           .split("\n")
           .find((l) => l.includes('"event":"listening"'))!;
@@ -492,6 +493,7 @@ describe("validation and telemetry", () => {
         await exited;
       }
     },
+    45_000,
   );
 });
 
