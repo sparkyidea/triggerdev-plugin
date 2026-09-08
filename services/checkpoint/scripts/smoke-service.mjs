@@ -3,7 +3,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { CheckpointService, snapshotImageRef } from "../src/checkpoint-service.js";
+import { CheckpointService } from "../src/checkpoint-service.js";
 import { loadConfig } from "../src/config.js";
 import { DockerClient, containerIpAddresses } from "../src/docker.js";
 import { createStorage } from "../src/storage.js";
@@ -69,13 +69,22 @@ const job = await suspend(sourceName, "snapshot_smoke_1");
 assert.equal(job.state, "completed", job.error);
 assert.equal(await docker.inspectContainerOrNull(source.Id), null, "source must be deleted before restore");
 assert.equal(callbacks.at(-1).success, true);
-const restored = await service.restore({ runFriendlyId: runId, snapshotFriendlyId: "snapshot_smoke_2", body: {
+const restoreRequest = { runFriendlyId: runId, snapshotFriendlyId: "snapshot_smoke_2", body: {
   checkpoint: { id: `checkpoint_${suffix}`, type: "DOCKER", location: job.location, imageRef: job.rootfsImageRef },
-} });
+} };
+const restored = await service.restore(restoreRequest);
 const after = await readMarker(restored.runnerId);
 assert.equal(after.marker, before.marker);
 assert.ok(after.count >= before.count);
 console.log("SMOKE_FRESH_RESTORE_PASS", { before, after, runnerId: restored.runnerId });
+assert.equal((await service.restore(restoreRequest)).duplicate, true);
+const restarted = new CheckpointService({ config, docker, storage, registry });
+await restarted.init();
+assert.equal((await restarted.restore(restoreRequest)).duplicate, true);
+const restoredIp = containerIpAddresses(await docker.inspectContainer(restored.runnerId))[0];
+assert.equal((await restarted.metadataFor(restoredIp)).TRIGGER_RUN_ID, runId);
+console.log("SMOKE_DUPLICATE_RESTART_PASS", { runId });
+
 
 // Exercise the failure boundary that stranded the real parent, without a cold start.
 const pushImage = docker.pushImage.bind(docker);
@@ -92,7 +101,7 @@ console.log("SMOKE_SOURCE_RECOVERY_PASS", recovered);
 // Cleanup is limited to this UUID-labelled test and its unique object/image tags.
 await docker.removeContainer(restored.runnerId, true);
 await service.deleteRun(runId);
-await docker.removeImage(snapshotImageRef(config.rootfs.registryImage, runId, "snapshot_smoke_recovery"));
+assert.equal(service.jobs.size, 0, "successful cleanup must evict owned jobs");
 await docker.dispatcher.close();
 storage.client?.destroy();
 console.log("SMOKE_PASS", runId);

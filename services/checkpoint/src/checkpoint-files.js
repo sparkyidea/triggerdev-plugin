@@ -19,7 +19,7 @@ export async function checkpointContainerDirectory(dockerRootDir, containerId) {
 
 // A unique name prevents overwriting any Docker checkpoint, including leftovers
 // from earlier attempts. Only this invocation's staging directory is removed.
-export async function withStagedCheckpoint({ dockerRootDir, containerId, checkpointId, checkpointDir }, start) {
+export async function withStagedCheckpoint({ dockerRootDir, containerId, checkpointId, checkpointDir, measure = (_stage, operation) => operation() }, start) {
   if (!/^[A-Za-z0-9_-]{1,200}$/.test(checkpointId || "")) {
     throw new Error("Invalid checkpoint ID");
   }
@@ -39,7 +39,7 @@ export async function withStagedCheckpoint({ dockerRootDir, containerId, checkpo
   const destination = path.join(checkpoints, stagedId);
   let published = false;
   try {
-    await cp(source, staging, {
+    await measure("staging_copy", () => cp(source, staging, {
       recursive: true,
       preserveTimestamps: true,
       filter: async (file) => {
@@ -49,7 +49,7 @@ export async function withStagedCheckpoint({ dockerRootDir, containerId, checkpo
         }
         return true;
       },
-    });
+    }));
     await rename(staging, destination);
     published = true;
     return await start(stagedId);

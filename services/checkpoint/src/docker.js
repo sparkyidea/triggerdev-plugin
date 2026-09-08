@@ -93,7 +93,7 @@ export class DockerClient {
     });
   }
 
-  async startContainer(id, { checkpointId, checkpointDir } = {}) {
+  async startContainer(id, { checkpointId, checkpointDir, measure = (_stage, operation) => operation() } = {}) {
     if (checkpointId && checkpointDir) {
       const [info, container] = await Promise.all([this.info(), this.inspectContainer(id)]);
       return withStagedCheckpoint({
@@ -101,7 +101,8 @@ export class DockerClient {
         containerId: container.Id,
         checkpointId,
         checkpointDir,
-      }, (stagedId) => this.startContainer(container.Id, { checkpointId: stagedId }));
+        measure,
+      }, (stagedId) => measure("checkpoint_start", () => this.startContainer(container.Id, { checkpointId: stagedId })));
     }
     const query = checkpointId
       ? `?checkpoint=${encodeURIComponent(checkpointId)}`
@@ -148,9 +149,9 @@ export class DockerClient {
   }
 
   async removeImage(imageRef) {
-    await this.request(`/images/${encodeURIComponent(imageRef)}?force=1`, {
+    await this.request(`/images/${encodeURIComponent(imageRef)}?force=0`, {
       method: "DELETE",
-      allow: [404, 409],
+      allow: [404],
     });
   }
 

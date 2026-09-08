@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { lookup } from "node:dns/promises";
-import { access, mkdir, readdir, rm } from "node:fs/promises";
+import { access, mkdir, readdir, rm, rmdir } from "node:fs/promises";
 import path from "node:path";
 import {
   buildRestoreContainerSpec,
@@ -8,9 +8,10 @@ import {
   normalizeIp,
   registryAuthHeader,
 } from "./docker.js";
-import { readJson, runCommand, writeJsonAtomic } from "./files.js";
+import { createArchive, readJson, runCommand, writeJsonAtomic } from "./files.js";
 import { log } from "./log.js";
-import { TaskQueue } from "./queue.js";
+import { TaskQueue, KeyedLock } from "./queue.js";
+import { measure } from "./metrics.js";
 
 const TERMINAL_JOB_STATES = new Set(["completed", "cancelled", "failed"]);
 
@@ -25,6 +26,7 @@ export class CheckpointService {
       log("error", "Background checkpoint job failed", { error: errorMessage(error) })
     );
     this.jobs = new Map();
+    this.runLocks = new KeyedLock();
     this.abortControllers = new Map();
     this.metadataByIp = new Map();
     this.pendingMetadataRegistrations = 0;
@@ -83,7 +85,7 @@ export class CheckpointService {
 
   async metadataFor(remoteAddress) {
     const address = normalizeIp(remoteAddress);
-    const existing = this.metadataByIp.get(address);
+    const existing = await this.verifiedMetadata(address);
     if (existing) return existing;
 
     // startContainer can wake the restored process just before the post-start
@@ -91,24 +93,65 @@ export class CheckpointService {
     // window; ordinary runners still receive {} immediately.
     for (let attempt = 0; this.pendingMetadataRegistrations > 0 && attempt < 100; attempt += 1) {
       await delay(50);
-      const metadata = this.metadataByIp.get(address);
+      const metadata = await this.verifiedMetadata(address);
       if (metadata) return metadata;
     }
     return {};
   }
 
-  async acceptSuspend({ runFriendlyId, snapshotFriendlyId, body }) {
+  async verifiedMetadata(address) {
+    const entry = this.metadataByIp.get(address);
+    if (!entry) return undefined;
+    let inspect;
+    try {
+      inspect = await this.docker.inspectContainerOrNull(entry.containerId);
+    } catch {
+      // A Docker outage is not proof of ownership or of container removal.
+      return undefined;
+    }
+    if (!metadataOwnerMatches(inspect, entry) || !inspect.State?.Running ||
+        !containerIpAddresses(inspect).includes(address)) {
+      this.removeMetadata(entry.containerId);
+      return undefined;
+    }
+    if (inspect.State?.Paused) return undefined;
+    // Registration or old-owner cleanup may have happened during the inspect.
+    if (this.metadataByIp.get(address) !== entry) return undefined;
+    return entry.metadata;
+  }
+
+  removeMetadata(containerId) {
+    for (const [ip, entry] of this.metadataByIp) {
+      if (entry.containerId === containerId) this.metadataByIp.delete(ip);
+    }
+  }
+
+  async acceptSuspend(request) {
+    validateId("runFriendlyId", request.runFriendlyId);
+    validateId("snapshotFriendlyId", request.snapshotFriendlyId);
+    validateSuspendBody(request.body, request.runFriendlyId, request.snapshotFriendlyId);
+    const existing = this.jobs.get(jobKey(request.runFriendlyId, request.snapshotFriendlyId));
+    if (existing && !existing.cancelRequested && !existing.deletionRequested && !existing.recoveryError &&
+        !["failed", "cancelled"].includes(existing.state)) return { ok: true, duplicate: true };
+    return this.runLocks.run(request.runFriendlyId, () => this.acceptSuspendLocked(request));
+  }
+
+  async acceptSuspendLocked({ runFriendlyId, snapshotFriendlyId, body }) {
     validateId("runFriendlyId", runFriendlyId);
     validateId("snapshotFriendlyId", snapshotFriendlyId);
     validateSuspendBody(body, runFriendlyId, snapshotFriendlyId);
+    if (await exists(this.cancelFile(runFriendlyId))) throw new Error("Run cancellation is pending cleanup");
     const key = jobKey(runFriendlyId, snapshotFriendlyId);
     const existing = this.jobs.get(key);
+    if (existing?.recoveryError || existing?.deletionRequested) throw new Error("Run requires recovery or cleanup before retry");
     if (existing && existing.state !== "failed" && existing.state !== "cancelled") {
       return { ok: true, duplicate: true };
     }
 
     const job = {
-      schemaVersion: 1,
+      schemaVersion: 2,
+      rootfsRepository: existing?.rootfsRepository ||
+        (this.config.rootfs.mode === "registry" ? this.config.rootfs.registryImage : undefined),
       state: "accepted",
       acceptedAt: new Date().toISOString(),
       runFriendlyId,
@@ -122,11 +165,21 @@ export class CheckpointService {
     return { ok: true };
   }
 
-  async processSuspend(job) {
+  processSuspend(job) {
+    return this.runLocks.run(job.runFriendlyId, () => {
+      if (this.jobs.get(jobKey(job.runFriendlyId, job.snapshotFriendlyId)) !== job ||
+          TERMINAL_JOB_STATES.has(job.state)) return;
+      return this.processSuspendLocked(job);
+    });
+  }
+
+  async processSuspendLocked(job) {
     const key = jobKey(job.runFriendlyId, job.snapshotFriendlyId);
     const abortController = new AbortController();
     this.abortControllers.set(key, abortController);
+    if (job.cancelRequested || await exists(this.cancelFile(job.runFriendlyId))) abortController.abort();
     try {
+      throwIfAborted(abortController.signal);
       const workDir = this.jobDir(job.runFriendlyId, job.snapshotFriendlyId);
       const checkpointDir = path.join(workDir, "checkpoint");
       const manifestFile = path.join(workDir, "manifest.json");
@@ -135,11 +188,11 @@ export class CheckpointService {
 
       if (job.state === "accepted") {
         throwIfAborted(abortController.signal);
-        const [container, dockerInfo, dockerVersion] = await Promise.all([
+        const [container, dockerInfo, dockerVersion] = await this.measured("prepare", job, () => Promise.all([
           this.docker.inspectContainer(job.body.runnerId),
           this.docker.info(),
           this.docker.version(),
-        ]);
+        ]));
         if (container.HostConfig?.AutoRemove) {
           throw new Error(
             "Runner has AutoRemove enabled. Set DOCKER_AUTOREMOVE_EXITED_CONTAINERS=0 before enabling checkpoints"
@@ -174,7 +227,7 @@ export class CheckpointService {
         const checkpointPath = path.join(checkpointDir, job.checkpointId);
         if (container.State?.Running) {
           await rm(checkpointPath, { recursive: true, force: true });
-          await this.docker.checkpointContainer(job.body.runnerId, job.checkpointId, checkpointDir);
+          await this.measured("checkpoint", job, () => this.docker.checkpointContainer(job.body.runnerId, job.checkpointId, checkpointDir));
         } else if (!(await exists(checkpointPath))) {
           throw new Error("Runner stopped during checkpoint, but no recoverable checkpoint exists");
         }
@@ -186,14 +239,17 @@ export class CheckpointService {
       if (job.state === "checkpointed") {
         throwIfAborted(abortController.signal);
         const manifest = await readJson(manifestFile);
-        if (this.config.rootfs.mode === "registry") {
+        if (job.rootfsRepository) {
           const imageRef = snapshotImageRef(
-            this.config.rootfs.registryImage,
+            job.rootfsRepository,
             job.runFriendlyId,
             job.snapshotFriendlyId
           );
-          await this.docker.commitContainer(job.body.runnerId, imageRef);
-          await this.docker.pushImage(imageRef, this.registryAuth());
+          await this.measured("commit", job, () => this.docker.commitContainer(job.body.runnerId, imageRef));
+          job.rootfsImageRef = imageRef;
+          await this.saveJob(job);
+          throwIfAborted(abortController.signal);
+          await this.measured("push", job, () => this.docker.pushImage(imageRef, this.registryAuth()));
           manifest.rootfsImageRef = imageRef;
           await writeJsonAtomic(manifestFile, manifest);
           job.rootfsImageRef = imageRef;
@@ -204,25 +260,20 @@ export class CheckpointService {
 
       if (job.state === "rootfs_captured") {
         throwIfAborted(abortController.signal);
-        await runCommand("tar", [
-          "-C",
-          workDir,
-          "-czf",
-          archiveFile,
-          "manifest.json",
-          path.join("checkpoint", job.checkpointId),
-        ]);
+        await this.measured("compress", { ...job, artifactPath: archiveFile }, () => createArchive(workDir, archiveFile,
+          ["manifest.json", path.join("checkpoint", job.checkpointId)], this.config.gzipLevel ?? 6));
         job.state = "archived";
         await this.saveJob(job);
       }
 
       if (job.state === "archived") {
         throwIfAborted(abortController.signal);
-        job.location = await this.storage.putCheckpoint({
+        job.location = await this.measured("upload", job, () => this.storage.putCheckpoint({
           runFriendlyId: job.runFriendlyId,
           snapshotFriendlyId: job.snapshotFriendlyId,
           archivePath: archiveFile,
-        });
+          signal: abortController.signal,
+        }));
         job.state = "uploaded";
         await this.saveJob(job);
       }
@@ -254,10 +305,9 @@ export class CheckpointService {
           snapshotFriendlyId: job.snapshotFriendlyId,
           location: job.location,
         });
-        await this.cleanupCompletedSuspend(job, checkpointDir, archiveFile);
+        await this.measured("suspend_cleanup", job, () => this.cleanupCompletedSuspend(job, checkpointDir, archiveFile));
       }
     } catch (error) {
-      if (job.state === "cancelled") return;
       const message = errorMessage(error);
       log("error", "Checkpoint failed", {
         runFriendlyId: job.runFriendlyId,
@@ -265,7 +315,7 @@ export class CheckpointService {
         state: job.state,
         error: message,
       });
-      await this.recoverSourceRunner(job).catch((recoveryError) => {
+      await this.measured("source_recovery", job, () => this.recoverSourceRunner(job)).catch((recoveryError) => {
         job.recoveryError = errorMessage(recoveryError);
         log("error", "Failed to recover source runner", {
           runFriendlyId: job.runFriendlyId,
@@ -273,7 +323,7 @@ export class CheckpointService {
         });
       });
       await this.submitSuspendCompletion(job, { success: false, error: message }).catch(() => {});
-      job.state = "failed";
+      job.state = abortController.signal.aborted ? "cancelled" : "failed";
       job.error = message;
       job.failedAt = new Date().toISOString();
       await this.saveJob(job);
@@ -286,27 +336,53 @@ export class CheckpointService {
     return this.queue.run(() => this.processRestore(request));
   }
 
-  async processRestore({ runFriendlyId, snapshotFriendlyId, body }) {
+  processRestore(request) {
+    return this.runLocks.run(request.runFriendlyId, () => this.processRestoreLocked(request));
+  }
+
+  async processRestoreLocked({ runFriendlyId, snapshotFriendlyId, body }) {
     validateId("runFriendlyId", runFriendlyId);
     validateId("snapshotFriendlyId", snapshotFriendlyId);
     validateRestoreBody(body);
     const checkpoint = body.checkpoint;
     const restoreDir = this.restoreDir(runFriendlyId, snapshotFriendlyId);
     const archiveFile = path.join(restoreDir, "checkpoint.tar.gz");
+    const record = await readOptionalJson(path.join(restoreDir, "restore.json"));
+    const runnerId = restoreRunnerId(runFriendlyId, checkpoint.id);
+    const existing = await this.docker.inspectContainerOrNull(runnerId);
+    const recorded = record && record.containerId !== existing?.Id
+      ? await this.docker.inspectContainerOrNull(record.containerId) : existing;
+    if (recorded && !containerFinished(recorded) && recorded.Id !== existing?.Id) {
+      throw new Error("Restore directory belongs to another live container");
+    }
+    if (record) validateRestoreRecord(record);
+    if (existing) {
+      if (!record || record.runFriendlyId !== runFriendlyId ||
+          record.snapshotFriendlyId !== snapshotFriendlyId || record.runnerId !== runnerId ||
+          !metadataOwnerMatches(existing, record) ||
+          existing.Config?.Labels?.["dev.trigger.checkpoint.id"] !== record.checkpointDatabaseId) {
+        throw new Error("Existing restore container ownership does not match persisted identity");
+      }
+      if (record.checkpointDatabaseId !== checkpoint.id || record.location !== checkpoint.location) {
+        throw new Error("Existing restore checkpoint identity is missing or does not match");
+      }
+      if (existing.State?.Running && !existing.State?.Paused) {
+        this.registerMetadata(existing, record.metadata);
+        return { ok: true, duplicate: true, runnerId };
+      }
+      if (!containerFinished(existing) && existing.State?.Status !== "created") {
+        throw new Error("Existing restore container is not safe to replace");
+      }
+      await this.docker.removeContainer(existing.Id, true);
+      this.removeMetadata(existing.Id);
+    }
     await rm(restoreDir, { recursive: true, force: true });
     await mkdir(restoreDir, { recursive: true });
-    await this.storage.getCheckpoint(checkpoint.location, archiveFile);
-    await runCommand("tar", ["-C", restoreDir, "-xzf", archiveFile]);
+    await this.measured("download", { runFriendlyId, snapshotFriendlyId, artifactPath: archiveFile }, () => this.storage.getCheckpoint(checkpoint.location, archiveFile));
+    await this.measured("extract", { runFriendlyId, snapshotFriendlyId }, () => runCommand("tar", ["-C", restoreDir, "-xzf", archiveFile]));
     const manifest = await readJson(path.join(restoreDir, "manifest.json"));
     validateManifest(manifest, runFriendlyId);
     await this.assertCompatible(manifest);
-
-    const runnerId = restoreRunnerId(runFriendlyId, checkpoint.id);
-    const existing = await this.docker.inspectContainerOrNull(runnerId);
-    if (existing?.State?.Running) {
-      return { ok: true, duplicate: true, runnerId };
-    }
-    if (existing) await this.docker.removeContainer(runnerId, true);
 
     const imageRef = manifest.rootfsImageRef || checkpoint.imageRef || body.image;
     if (!imageRef) throw new Error("No root filesystem image is available for restore");
@@ -317,8 +393,9 @@ export class CheckpointService {
     const spec = buildRestoreContainerSpec(manifest.container, imageRef, {
       "dev.trigger.checkpoint.run": runFriendlyId,
       "dev.trigger.checkpoint.snapshot": snapshotFriendlyId,
+      "dev.trigger.checkpoint.id": checkpoint.id,
     });
-    const created = await this.docker.createContainer(runnerId, spec);
+    const created = await this.measured("create", { runFriendlyId, snapshotFriendlyId }, () => this.docker.createContainer(runnerId, spec));
     const metadata = {
       TRIGGER_RUN_ID: runFriendlyId,
       TRIGGER_SNAPSHOT_ID: snapshotFriendlyId,
@@ -329,11 +406,14 @@ export class CheckpointService {
       TRIGGER_RUNNER_ID: runnerId,
     };
     const restoreRecord = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       runFriendlyId,
       snapshotFriendlyId,
       runnerId,
       containerId: created.Id,
+      checkpointDatabaseId: checkpoint.id,
+      checkpointId: manifest.checkpointId,
+      location: checkpoint.location,
       metadata,
     };
     await writeJsonAtomic(path.join(restoreDir, "restore.json"), restoreRecord);
@@ -342,10 +422,11 @@ export class CheckpointService {
       await this.docker.startContainer(created.Id, {
         checkpointId: manifest.checkpointId,
         checkpointDir: path.join(restoreDir, "checkpoint"),
+        measure: (stage, operation) => this.measured(stage, { runFriendlyId, snapshotFriendlyId }, operation),
       });
       // Docker assigns endpoint addresses while starting the container. Inspecting
       // immediately after create returns empty addresses and leaves /env unmapped.
-      await this.registerStartedMetadata(created.Id, metadata);
+      await this.measured("metadata", { runFriendlyId, snapshotFriendlyId }, () => this.registerStartedMetadata(created.Id, metadata));
     } finally {
       this.pendingMetadataRegistrations -= 1;
     }
@@ -369,47 +450,97 @@ export class CheckpointService {
     }
   }
 
+  cancelFile(runFriendlyId) {
+    return path.join(this.jobsRoot(), runFriendlyId, "cancel.json");
+  }
+
   async cancelRun(runFriendlyId) {
     validateId("runFriendlyId", runFriendlyId);
+    // Separate durable marker avoids racing the operation's job.json state writes.
+    await writeJsonAtomic(this.cancelFile(runFriendlyId), { runFriendlyId });
     for (const [key, job] of this.jobs) {
       if (job.runFriendlyId !== runFriendlyId || TERMINAL_JOB_STATES.has(job.state)) continue;
-      const recoveryJob = { ...job };
-      job.state = "cancelled";
-      job.cancelledAt = new Date().toISOString();
+      job.cancelRequested = true;
       this.abortControllers.get(key)?.abort();
-      await this.saveJob(job);
-      await this.recoverSourceRunner(recoveryJob).catch(() => {});
     }
     this.queue.add(() => this.deleteRun(runFriendlyId));
   }
 
-  async deleteRun(runFriendlyId) {
+  deleteRun(runFriendlyId) {
     validateId("runFriendlyId", runFriendlyId);
+    return this.runLocks.run(runFriendlyId, () => this.measured("delete", { runFriendlyId }, () => this.deleteRunLocked(runFriendlyId)));
+  }
+
+  async deleteRunLocked(runFriendlyId) {
     const jobDir = path.join(this.jobsRoot(), runFriendlyId);
-    const imageRefs = [];
+    const records = new Map();
     for (const file of await findNamedFiles(jobDir, "job.json")) {
-      try {
-        const job = await readJson(file);
-        if (job.rootfsImageRef) imageRefs.push(job.rootfsImageRef);
-      } catch {}
+      const job = await readJson(file); // Retain corrupt records for repair, not silent deletion.
+      validateJobRecord(job);
+      if (job.runFriendlyId !== runFriendlyId ||
+          file !== path.join(this.jobDir(runFriendlyId, job.snapshotFriendlyId), "job.json")) {
+        throw new Error("Cleanup job identity does not match its directory");
+      }
+      records.set(jobKey(runFriendlyId, job.snapshotFriendlyId), job);
     }
-    await this.storage.deleteRun(runFriendlyId);
-    for (const imageRef of imageRefs) {
-      await this.docker.removeImage(imageRef).catch(() => {});
-      if (this.registry?.enabled) {
-        await this.registry.deleteImage(imageRef).catch((error) =>
-          log("error", "Unable to delete checkpoint image from registry", {
-            imageRef,
-            error: errorMessage(error),
-          })
-        );
+    for (const [key, job] of this.jobs) {
+      if (job.runFriendlyId === runFriendlyId) records.set(key, job);
+    }
+    for (const job of records.values()) {
+      if (!TERMINAL_JOB_STATES.has(job.state) || job.recoveryError) {
+        throw new Error("Run has active or failed-recovery jobs; retaining checkpoint artifacts");
       }
     }
-    await Promise.all([
-      rm(jobDir, { recursive: true, force: true }),
-      rm(path.join(this.restoresRoot(), runFriendlyId), { recursive: true, force: true }),
-    ]);
+    const imageRefs = new Set();
+    for (const job of records.values()) {
+      job.deletionRequested = true;
+      await this.saveJob(job);
+      for (const ref of ownedSnapshotImages(job)) imageRefs.add(ref);
+    }
+    // Keep job.json until every deletion succeeds so restart/reaper can retry.
+    await this.storage.deleteRun(runFriendlyId);
+    for (const imageRef of imageRefs) {
+      await this.docker.removeImage(imageRef);
+      if (this.registry?.enabled) await this.registry.deleteImage(imageRef);
+    }
+    await this.cleanupRestoreRecords(runFriendlyId);
+    const restoreRoot = path.join(this.restoresRoot(), runFriendlyId);
+    // Failed downloads/extractions can leave a directory before restore.json exists.
+    for (const entry of await readdir(restoreRoot, { withFileTypes: true }).catch((error) => {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    })) {
+      const directory = path.join(restoreRoot, entry.name);
+      if (entry.isDirectory() && !(await exists(path.join(directory, "restore.json")))) {
+        await rm(directory, { recursive: true, force: true });
+      }
+    }
+    await removeEmptyDirectory(restoreRoot);
+    await rm(jobDir, { recursive: true, force: true });
+    for (const [key, job] of records) {
+      if (this.jobs.get(key) === job) this.jobs.delete(key);
+    }
     log("info", "Deleted run checkpoints", { runFriendlyId });
+  }
+
+  async cleanupRestoreRecords(runFriendlyId) {
+    const root = runFriendlyId ? path.join(this.restoresRoot(), runFriendlyId) : this.restoresRoot();
+    for (const file of await findNamedFiles(root, "restore.json")) {
+      const record = await readJson(file);
+      validateRestoreRecord(record);
+      if (file !== path.join(this.restoreDir(record.runFriendlyId, record.snapshotFriendlyId), "restore.json")) {
+        throw new Error("Restore record directory does not match identity");
+      }
+      const inspect = await this.docker.inspectContainerOrNull(record.containerId);
+      if (inspect && !containerFinished(inspect)) continue;
+      this.removeMetadata(record.containerId);
+      await rm(path.dirname(file), { recursive: true, force: true });
+      await removeEmptyDirectory(path.dirname(path.dirname(file)));
+    }
+  }
+
+  measured(stage, identity, operation) {
+    return measure(this.config.metricsEnabled, stage, identity, operation);
   }
 
   async recoverSourceRunner(job) {
@@ -423,6 +554,7 @@ export class CheckpointService {
         await this.docker.startContainer(job.body.runnerId, {
           checkpointId: job.checkpointId,
           checkpointDir,
+          measure: (stage, operation) => this.measured(stage, job, operation),
         });
         return;
       } catch (error) {
@@ -498,8 +630,11 @@ export class CheckpointService {
   }
 
   registerMetadata(containerInspect, metadata) {
+    const entry = { containerId: containerInspect.Id, metadata };
+    if (!metadataOwnerMatches(containerInspect, entry) || !containerInspect.State?.Running || containerInspect.State?.Paused) return 0;
+    this.removeMetadata(containerInspect.Id);
     const addresses = containerIpAddresses(containerInspect);
-    for (const ip of addresses) this.metadataByIp.set(ip, metadata);
+    for (const ip of addresses) this.metadataByIp.set(ip, entry);
     return addresses.length;
   }
 
@@ -513,31 +648,66 @@ export class CheckpointService {
   }
 
   async recoverJobs() {
+    const cancelledRuns = new Set();
+    const deleteRuns = new Set();
+    // Load and validate the whole index before scheduling work or cleanup.
     for (const file of await findNamedFiles(this.jobsRoot(), "job.json")) {
-      try {
-        const job = await readJson(file);
-        const key = jobKey(job.runFriendlyId, job.snapshotFriendlyId);
-        this.jobs.set(key, job);
-        if (!TERMINAL_JOB_STATES.has(job.state)) this.queue.add(() => this.processSuspend(job));
-      } catch (error) {
-        log("error", "Unable to recover checkpoint job", { file, error: errorMessage(error) });
+      const job = await readJson(file);
+      validateJobRecord(job);
+      if (file !== path.join(this.jobDir(job.runFriendlyId, job.snapshotFriendlyId), "job.json")) {
+        throw new Error("Recovered job directory does not match identity");
+      }
+      this.jobs.set(jobKey(job.runFriendlyId, job.snapshotFriendlyId), job);
+      if (await exists(this.cancelFile(job.runFriendlyId))) cancelledRuns.add(job.runFriendlyId);
+      if (job.deletionRequested) deleteRuns.add(job.runFriendlyId);
+    }
+    for (const file of await findNamedFiles(this.jobsRoot(), "cancel.json")) {
+      const record = await readJson(file);
+      validateId("runFriendlyId", record.runFriendlyId);
+      if (file !== this.cancelFile(record.runFriendlyId)) throw new Error("Cancellation directory does not match identity");
+      cancelledRuns.add(record.runFriendlyId);
+    }
+    for (const job of this.jobs.values()) {
+      if (!job.deletionRequested && !TERMINAL_JOB_STATES.has(job.state)) {
+        this.queue.add(() => this.processSuspend(job));
       }
     }
+    for (const run of new Set([...deleteRuns, ...cancelledRuns])) this.queue.add(() => this.deleteRun(run));
   }
 
   async recoverRestoreMappings() {
     for (const file of await findNamedFiles(this.restoresRoot(), "restore.json")) {
-      try {
-        const record = await readJson(file);
-        const inspect = await this.docker.inspectContainerOrNull(record.containerId);
-        if (inspect) this.registerMetadata(inspect, record.metadata);
-      } catch (error) {
-        log("error", "Unable to recover restore metadata", { file, error: errorMessage(error) });
+      const record = await readJson(file);
+      validateRestoreRecord(record);
+      if (file !== path.join(this.restoreDir(record.runFriendlyId, record.snapshotFriendlyId), "restore.json")) {
+        throw new Error("Recovered restore directory does not match identity");
       }
+      const inspect = await this.docker.inspectContainerOrNull(record.containerId);
+      if (inspect) this.registerMetadata(inspect, record.metadata);
     }
   }
 
   async reapExitedRunners() {
+    if (this.reaperRunning) return;
+    this.reaperRunning = true;
+    try { await this.reapExitedRunnersOnce(); }
+    finally { this.reaperRunning = false; }
+  }
+
+  async reapExitedRunnersOnce() {
+    for (const ip of [...this.metadataByIp.keys()]) await this.verifiedMetadata(ip);
+    const restoreRuns = new Set((await findNamedFiles(this.restoresRoot(), "restore.json"))
+      .map((file) => path.basename(path.dirname(path.dirname(file)))));
+    for (const run of restoreRuns) {
+      if (this.runLocks.tails.has(run)) continue;
+      await this.runLocks.run(run, () => this.cleanupRestoreRecords(run));
+    }
+    const pendingDeletes = new Set([...this.jobs.values()]
+      .filter((job) => job.deletionRequested && !job.recoveryError).map((job) => job.runFriendlyId));
+    for (const run of pendingDeletes) {
+      if (this.runLocks.tails.has(run)) continue;
+      await this.deleteRun(run).catch((error) => log("error", "Run cleanup retry failed", { runFriendlyId: run, error: errorMessage(error) }));
+    }
     const containers = await this.docker.listExitedRunnerContainers();
     const protectedRunners = new Set(
       [...this.jobs.values()]
@@ -701,7 +871,60 @@ async function exists(target) {
   try {
     await access(target);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
   }
+}
+
+async function readOptionalJson(file) {
+  try { return await readJson(file); }
+  catch (error) { if (error.code === "ENOENT") return undefined; throw error; }
+}
+
+function metadataOwnerMatches(inspect, entry) {
+  if (!/^[a-f0-9]{64}$/.test(entry.containerId || "") || inspect?.Id !== entry.containerId) return false;
+  const labels = inspect.Config?.Labels || {};
+  return labels["dev.trigger.checkpoint.run"] === entry.metadata?.TRIGGER_RUN_ID &&
+    labels["dev.trigger.checkpoint.snapshot"] === entry.metadata?.TRIGGER_SNAPSHOT_ID;
+}
+
+function validateRestoreRecord(record) {
+  if (record.schemaVersion !== 2 || !record.checkpointDatabaseId || !record.location) {
+    throw new Error("Restore checkpoint identity is missing or unsupported");
+  }
+  validateId("runFriendlyId", record.runFriendlyId);
+  validateId("snapshotFriendlyId", record.snapshotFriendlyId);
+  if (record.metadata?.TRIGGER_RUN_ID !== record.runFriendlyId ||
+      record.metadata?.TRIGGER_SNAPSHOT_ID !== record.snapshotFriendlyId ||
+      record.metadata?.TRIGGER_RUNNER_ID !== record.runnerId) throw new Error("Restore metadata identity does not match record");
+  if (!/^[a-f0-9]{64}$/.test(record.containerId || "")) throw new Error("Invalid restore container ID");
+}
+
+function containerFinished(inspect) {
+  return ["exited", "dead"].includes(inspect.State?.Status);
+}
+
+async function removeEmptyDirectory(directory) {
+  await rmdir(directory).catch((error) => {
+    if (!["ENOENT", "ENOTEMPTY", "EEXIST"].includes(error.code)) throw error;
+  });
+}
+
+export function ownedSnapshotImages(job) {
+  if (!job.rootfsRepository) {
+    if (job.rootfsImageRef) throw new Error("Snapshot repository is required for owned identity");
+    return [];
+  }
+  const ref = snapshotImageRef(job.rootfsRepository, job.runFriendlyId, job.snapshotFriendlyId);
+  if (job.rootfsImageRef && job.rootfsImageRef !== ref) {
+    throw new Error("Persisted snapshot image does not match owned identity");
+  }
+  return [ref];
+}
+
+function validateJobRecord(job) {
+  if (job.schemaVersion !== 2) throw new Error("Unsupported checkpoint job schema");
+  validateId("runFriendlyId", job.runFriendlyId);
+  validateId("snapshotFriendlyId", job.snapshotFriendlyId);
 }

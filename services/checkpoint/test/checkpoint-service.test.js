@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, writeFile, rm, access } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { CheckpointService, restoreRunnerId } from "../src/checkpoint-service.js";
+import { CheckpointService, restoreRunnerId, snapshotImageRef } from "../src/checkpoint-service.js";
 import { LocalStorage } from "../src/storage.js";
 
 function testConfig(root) {
@@ -31,6 +31,8 @@ function testConfig(root) {
 function createFakeDocker() {
   const calls = [];
   let restoredContainerStarted = false;
+  let restoredSpec;
+  let restoredName;
   const oldInspect = {
     Config: { Image: "registry/tasks:v1", Env: ["A=1"], Cmd: ["node", "app.js"] },
     HostConfig: { AutoRemove: false, NetworkMode: "supervisor", Memory: 1234 },
@@ -48,9 +50,11 @@ function createFakeDocker() {
     },
     async inspectContainer(id) {
       calls.push(["inspect", id]);
-      if (id === "container-created") {
+      if (id === "a".repeat(64)) {
         return {
-          State: { Running: restoredContainerStarted },
+          Id: "a".repeat(64),
+          Config: restoredSpec,
+          State: { Running: restoredContainerStarted, Status: restoredContainerStarted ? "running" : "created" },
           NetworkSettings: {
             Networks: {
               supervisor: { IPAddress: restoredContainerStarted ? "172.20.0.12" : "" },
@@ -60,7 +64,8 @@ function createFakeDocker() {
       }
       return oldInspect;
     },
-    async inspectContainerOrNull() {
+    async inspectContainerOrNull(id) {
+      if (restoredSpec && [restoredName, "a".repeat(64)].includes(id)) return this.inspectContainer("a".repeat(64));
       return null;
     },
     async checkpointContainer(id, checkpointId, checkpointDir) {
@@ -77,11 +82,12 @@ function createFakeDocker() {
     },
     async createContainer(name, spec) {
       calls.push(["create", name, spec]);
-      return { Id: "container-created" };
+      restoredSpec = spec; restoredName = name;
+      return { Id: "a".repeat(64) };
     },
     async startContainer(id, options) {
       calls.push(["start", id, options]);
-      if (id === "container-created") restoredContainerStarted = true;
+      if (id === "a".repeat(64)) restoredContainerStarted = true;
     },
     async listExitedRunnerContainers() {
       return [];
@@ -158,10 +164,10 @@ test("suspends, archives, calls back, and restores a runner", async () => {
   assert.equal(result.runnerId, restoreRunnerId("run_abc", databaseCheckpointId));
   assert.equal((await service.metadataFor("172.20.0.12")).TRIGGER_SNAPSHOT_ID, "snapshot_2");
   const startIndex = docker.calls.findIndex(
-    ([operation, id]) => operation === "start" && id === "container-created"
+    ([operation, id]) => operation === "start" && id === "a".repeat(64)
   );
   const postStartInspectIndex = docker.calls.findIndex(
-    ([operation, id], index) => operation === "inspect" && id === "container-created" && index > startIndex
+    ([operation, id], index) => operation === "inspect" && id === "a".repeat(64) && index > startIndex
   );
   assert.ok(startIndex >= 0);
   assert.ok(postStartInspectIndex > startIndex);
@@ -249,7 +255,9 @@ test("holds an early restored-runner metadata lookup until its IP is registered"
   service.pendingMetadataRegistrations = 1;
   const lookup = service.metadataFor("172.20.0.25");
   setImmediate(() => {
-    service.metadataByIp.set("172.20.0.25", { TRIGGER_RUN_ID: "run_race" });
+    const inspect = ownedContainer("b".repeat(64), "172.20.0.25", "run_race", "snapshot_1");
+    service.docker.inspectContainerOrNull = async () => inspect;
+    service.registerMetadata(inspect, { TRIGGER_RUN_ID: "run_race", TRIGGER_SNAPSHOT_ID: "snapshot_1" });
     service.pendingMetadataRegistrations = 0;
   });
 
@@ -407,4 +415,285 @@ test("refuses to checkpoint auto-remove runners before stopping them", async () 
   await waitFor(() => service.jobs.get("run_noauto:snapshot_1")?.state === "failed");
   assert.equal(callbacks.at(-1).success, false);
   assert.match(callbacks.at(-1).error, /AutoRemove enabled/);
+});
+
+function ownedContainer(id, ip, run = "run_owner", snapshot = "snapshot_1") {
+  return { Id: id, Config: { Labels: { "dev.trigger.checkpoint.run": run,
+    "dev.trigger.checkpoint.snapshot": snapshot } }, State: { Running: true, Status: "running" },
+    NetworkSettings: { Networks: { supervisor: { IPAddress: ip } } } };
+}
+
+async function fixture(t) {
+  const root = await mkdtemp(path.join(os.tmpdir(), "checkpoint-lifecycle-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const docker = createFakeDocker();
+  const config = testConfig(root);
+  const service = new CheckpointService({ config, docker,
+    storage: new LocalStorage(path.join(root, "archives")), registry: { enabled: false },
+    fetchImpl: async () => Response.json({ ok: true }) });
+  await service.init();
+  return { root, docker, config, service };
+}
+
+for (const state of ["removed", "exited", "different-ip", "different-labels", "docker-error"]) {
+  test(`metadata never returns stale identity after ${state}`, async (t) => {
+    const { service, docker } = await fixture(t);
+    const owner = ownedContainer("b".repeat(64), "172.20.0.25");
+    const metadata = { TRIGGER_RUN_ID: "run_owner", TRIGGER_SNAPSHOT_ID: "snapshot_1" };
+    service.registerMetadata(owner, metadata);
+    docker.inspectContainerOrNull = async () => {
+      if (state === "docker-error") throw new Error("unavailable");
+      if (state === "removed") return null;
+      if (state === "exited") return { ...owner, State: { Running: false, Status: "exited" } };
+      if (state === "different-ip") return ownedContainer(owner.Id, "172.20.0.26");
+      return ownedContainer(owner.Id, "172.20.0.25", "run_other");
+    };
+    assert.deepEqual(await service.metadataFor("::ffff:172.20.0.25"), {});
+    if (state !== "docker-error") assert.equal(service.metadataByIp.size, 0);
+  });
+}
+
+test("old-owner cleanup and delayed lookup preserve a new owner's reused IP", async (t) => {
+  const { service, docker } = await fixture(t);
+  const old = ownedContainer("b".repeat(64), "172.20.0.25");
+  const next = ownedContainer("c".repeat(64), "172.20.0.25", "run_next");
+  service.registerMetadata(old, { TRIGGER_RUN_ID: "run_owner", TRIGGER_SNAPSHOT_ID: "snapshot_1" });
+  let release;
+  docker.inspectContainerOrNull = () => new Promise((resolve) => { release = resolve; });
+  const pending = service.metadataFor("172.20.0.25");
+  service.registerMetadata(next, { TRIGGER_RUN_ID: "run_next", TRIGGER_SNAPSHOT_ID: "snapshot_1" });
+  release(null);
+  assert.deepEqual(await pending, {});
+  service.removeMetadata(old.Id);
+  docker.inspectContainerOrNull = async () => next;
+  assert.equal((await service.metadataFor("172.20.0.25")).TRIGGER_RUN_ID, "run_next");
+});
+
+async function completedRestore(service, restoreNow = true) {
+  await service.acceptSuspend({ runFriendlyId: "run_dup", snapshotFriendlyId: "snapshot_source", body: {
+    type: "DOCKER", runId: "run_dup", snapshotId: "snapshot_source", runnerId: "runner-source",
+    projectRef: "proj_1", deploymentVersion: "1" } });
+  await waitFor(() => service.jobs.get("run_dup:snapshot_source")?.state === "completed");
+  const location = service.jobs.get("run_dup:snapshot_source").location;
+  const request = { runFriendlyId: "run_dup", snapshotFriendlyId: "snapshot_restore", body: {
+    checkpoint: { type: "DOCKER", id: "checkpoint_12345678", location } } };
+  if (restoreNow) await service.restore(request);
+  return request;
+}
+
+test("duplicate restore and checkpoint deletion preserve metadata across service restart", async (t) => {
+  const { service, docker, config } = await fixture(t);
+  const request = await completedRestore(service);
+  const file = path.join(service.restoreDir("run_dup", "snapshot_restore"), "restore.json");
+  const before = await readFile(file, "utf8");
+  service.storage.getCheckpoint = async () => { throw new Error("duplicate must not download"); };
+  assert.equal((await service.restore(request)).duplicate, true);
+  assert.equal(await readFile(file, "utf8"), before);
+  await service.deleteRun("run_dup");
+  assert.equal(service.jobs.size, 0);
+  assert.equal(await readFile(file, "utf8"), before);
+  const restarted = new CheckpointService({ config, docker, storage: service.storage });
+  await restarted.init();
+  assert.equal((await restarted.metadataFor("172.20.0.12")).TRIGGER_RUN_ID, "run_dup");
+  assert.equal((await restarted.restore(request)).duplicate, true);
+});
+
+for (const conflict of ["missing-record", "incomplete-record", "different-checkpoint", "different-container", "different-snapshot"]) {
+  test(`duplicate restore preserves live files on ${conflict}`, async (t) => {
+    const { service, docker } = await fixture(t);
+    const request = await completedRestore(service);
+    const directory = service.restoreDir("run_dup", "snapshot_restore");
+    const recordFile = path.join(directory, "restore.json");
+    if (conflict === "missing-record") await rm(recordFile);
+    if (conflict === "incomplete-record") {
+      const record = JSON.parse(await readFile(recordFile));
+      delete record.checkpointDatabaseId;
+      await writeFile(recordFile, JSON.stringify(record));
+    }
+    if (conflict === "different-checkpoint") request.body.checkpoint.id = "other_12345678";
+    if (conflict === "different-snapshot") request.snapshotFriendlyId = "snapshot_other";
+    if (conflict === "different-container") {
+      const inspect = await docker.inspectContainer("a".repeat(64));
+      docker.inspectContainerOrNull = async () => ({ ...inspect, Id: "d".repeat(64) });
+    }
+    const sentinel = path.join(directory, "keep.txt");
+    await writeFile(sentinel, "live runner data");
+    service.storage.getCheckpoint = async () => { throw new Error("must check identity before download"); };
+    await assert.rejects(service.restore(request), /identity|ownership|live container/);
+    assert.equal(await readFile(sentinel, "utf8"), "live runner data");
+  });
+}
+
+test("concurrent duplicate restores serialize even with queue concurrency two", async (t) => {
+  const { service, docker } = await fixture(t);
+  service.queue.concurrency = 2;
+  const request = await completedRestore(service, false);
+  const results = await Promise.all([service.restore(request), service.restore(request)]);
+  assert.equal(results.filter((result) => result.duplicate).length, 1);
+  assert.equal(docker.calls.filter(([op]) => op === "create").length, 1);
+  assert.equal(service.runLocks.tails.size, 0);
+});
+
+test("cleanup derives committed images without a persisted reference and retries failure after restart", async (t) => {
+  const { service, docker, config } = await fixture(t);
+  config.rootfs = { mode: "registry", registryImage: "registry.test/checkpoints" };
+  const job = { schemaVersion: 2, rootfsRepository: config.rootfs.registryImage, state: "failed", runFriendlyId: "run_cleanup_image",
+    snapshotFriendlyId: "snapshot_1", body: { runnerId: "runner-source" } };
+  service.jobs.set("run_cleanup_image:snapshot_1", job);
+  await service.saveJob(job);
+  const expected = snapshotImageRef(config.rootfs.registryImage, job.runFriendlyId, job.snapshotFriendlyId);
+  docker.removeImage = async (ref) => { assert.equal(ref, expected); throw new Error("image in use"); };
+  await assert.rejects(service.deleteRun(job.runFriendlyId), /image in use/);
+  assert.equal(service.jobs.size, 1);
+  assert.equal(JSON.parse(await readFile(path.join(service.jobDir(job.runFriendlyId, job.snapshotFriendlyId), "job.json"))).deletionRequested, true);
+  const removed = [];
+  docker.removeImage = async (ref) => removed.push(ref);
+  const restarted = new CheckpointService({ config, docker, storage: service.storage });
+  await restarted.init();
+  await waitFor(() => restarted.jobs.size === 0);
+  assert.deepEqual(removed, [expected]);
+  await restarted.deleteRun(job.runFriendlyId);
+  assert.equal(restarted.jobs.size, 0);
+});
+
+test("cleanup preserves failed recovery and rejects foreign image references", async (t) => {
+  const { service } = await fixture(t);
+  const job = { schemaVersion: 2, state: "failed", recoveryError: "restore failed", runFriendlyId: "run_protected",
+    snapshotFriendlyId: "snapshot_1", body: { runnerId: "runner-protected" } };
+  service.jobs.set("run_protected:snapshot_1", job);
+  await service.saveJob(job);
+  await assert.rejects(service.deleteRun(job.runFriendlyId), /failed-recovery/);
+  delete job.recoveryError;
+  job.rootfsImageRef = "registry.test/tasks:base";
+  await assert.rejects(service.deleteRun(job.runFriendlyId), /owned identity/);
+  assert.equal(service.jobs.size, 1);
+});
+
+test("job deduplication lasts until explicit successful cleanup, including restart", async (t) => {
+  const { service, docker, config } = await fixture(t);
+  const request = { runFriendlyId: "run_dedup", snapshotFriendlyId: "snapshot_1", body: {
+    type: "DOCKER", runId: "run_dedup", snapshotId: "snapshot_1", runnerId: "runner-source",
+    projectRef: "proj_1", deploymentVersion: "1" } };
+  for (let cycle = 0; cycle < 3; cycle++) {
+    assert.equal((await service.acceptSuspend(request)).duplicate, undefined);
+    await waitFor(() => service.jobs.get("run_dedup:snapshot_1")?.state === "completed");
+    assert.equal((await service.acceptSuspend(request)).duplicate, true);
+    await waitFor(() => service.queue.running === 0);
+    const restarted = new CheckpointService({ config, docker, storage: service.storage });
+    await restarted.init();
+    assert.equal((await restarted.acceptSuspend(request)).duplicate, true);
+    await service.deleteRun(request.runFriendlyId);
+    assert.equal(service.jobs.size, 0);
+    assert.equal(service.runLocks.tails.size, 0);
+  }
+});
+
+test("cancelling an in-flight dump waits for recovery before cleanup and eviction", async (t) => {
+  const { service, docker } = await fixture(t);
+  service.queue.concurrency = 2;
+  let release;
+  let entered = false;
+  const checkpoint = docker.checkpointContainer.bind(docker);
+  docker.checkpointContainer = async (...args) => {
+    await checkpoint(...args);
+    entered = true;
+    await new Promise((resolve) => { release = resolve; });
+  };
+  docker.inspectContainerOrNull = async () => ({ State: { Running: false } });
+  await service.acceptSuspend({ runFriendlyId: "run_cancel", snapshotFriendlyId: "snapshot_1", body: {
+    type: "DOCKER", runId: "run_cancel", snapshotId: "snapshot_1", runnerId: "runner-source",
+    projectRef: "proj_1", deploymentVersion: "1" } });
+  await waitFor(() => entered);
+  await service.cancelRun("run_cancel");
+  assert.equal(service.jobs.size, 1);
+  release();
+  await waitFor(() => service.jobs.size === 0);
+  assert.ok(docker.calls.some(([op]) => op === "start"));
+  assert.equal(service.abortControllers.size, 0);
+});
+
+test("push failure persists ownership and cleanup uses it after repository config changes", async (t) => {
+  const { service, docker, config } = await fixture(t);
+  config.rootfs = { mode: "registry", registryImage: "registry.test/checkpoints" };
+  const commits = [];
+  docker.commitContainer = async (_id, ref) => commits.push(ref);
+  docker.pushImage = async () => { throw new Error("push failed"); };
+  await service.acceptSuspend({ runFriendlyId: "run_push", snapshotFriendlyId: "snapshot_1", body: {
+    type: "DOCKER", runId: "run_push", snapshotId: "snapshot_1", runnerId: "runner-source",
+    projectRef: "proj_1", deploymentVersion: "1" } });
+  await waitFor(() => service.jobs.get("run_push:snapshot_1")?.state === "failed");
+  const job = service.jobs.get("run_push:snapshot_1");
+  assert.equal(job.rootfsImageRef, commits[0]);
+  assert.equal(JSON.parse(await readFile(path.join(service.jobDir("run_push", "snapshot_1"), "job.json"))).rootfsImageRef, commits[0]);
+  config.rootfs.registryImage = "registry.test/new-checkpoints";
+  const removed = [];
+  docker.removeImage = async (ref) => removed.push(ref);
+  await service.deleteRun("run_push");
+  assert.deepEqual(removed, commits);
+});
+
+test("queued cancellation survives restart without executing a new dump", async (t) => {
+  const { service, docker, config } = await fixture(t);
+  service.queue.concurrency = 0;
+  await service.acceptSuspend({ runFriendlyId: "run_restart_cancel", snapshotFriendlyId: "snapshot_1", body: {
+    type: "DOCKER", runId: "run_restart_cancel", snapshotId: "snapshot_1", runnerId: "runner-source",
+    projectRef: "proj_1", deploymentVersion: "1" } });
+  await service.cancelRun("run_restart_cancel");
+  const restarted = new CheckpointService({ config, docker, storage: service.storage,
+    fetchImpl: async () => Response.json({ ok: true }) });
+  await restarted.init();
+  await waitFor(() => restarted.jobs.size === 0 && restarted.queue.running === 0);
+  assert.equal(docker.calls.some(([op]) => op === "checkpoint"), false);
+});
+
+test("reaper removes restored metadata and durable files after runner exit", async (t) => {
+  const { service, docker } = await fixture(t);
+  await completedRestore(service);
+  const container = await docker.inspectContainer("a".repeat(64));
+  docker.inspectContainerOrNull = async () => ({ ...container, State: { Running: false, Status: "exited" } });
+  await service.reapExitedRunners();
+  assert.equal(service.metadataByIp.size, 0);
+  await assert.rejects(access(path.join(service.restoreDir("run_dup", "snapshot_restore"), "restore.json")), { code: "ENOENT" });
+});
+
+test("duplicate suspend acknowledges immediately while the original dump is in flight", async (t) => {
+  const { service, docker } = await fixture(t);
+  let release;
+  let entered = false;
+  const checkpoint = docker.checkpointContainer.bind(docker);
+  docker.checkpointContainer = async (...args) => {
+    entered = true;
+    await new Promise((resolve) => { release = resolve; });
+    await checkpoint(...args);
+  };
+  const request = { runFriendlyId: "run_inflight", snapshotFriendlyId: "snapshot_1", body: {
+    type: "DOCKER", runId: "run_inflight", snapshotId: "snapshot_1", runnerId: "runner-source",
+    projectRef: "proj_1", deploymentVersion: "1" } };
+  await service.acceptSuspend(request);
+  await waitFor(() => entered);
+  assert.equal((await service.acceptSuspend(request)).duplicate, true);
+  release();
+  await waitFor(() => service.jobs.get("run_inflight:snapshot_1")?.state === "completed");
+  await service.deleteRun("run_inflight");
+});
+
+test("empty cancellation is reclaimed after restart", async (t) => {
+  const { service, docker, config } = await fixture(t);
+  service.queue.concurrency = 0;
+  await service.cancelRun("run_empty");
+  const restarted = new CheckpointService({ config, docker, storage: service.storage });
+  await restarted.init();
+  await waitFor(() => restarted.queue.running === 0 && restarted.queue.pending.length === 0);
+  await assert.rejects(access(service.cancelFile("run_empty")), { code: "ENOENT" });
+});
+
+test("explicit cleanup removes failed restore downloads without deleting live restore records", async (t) => {
+  const { service } = await fixture(t);
+  await completedRestore(service);
+  const incomplete = service.restoreDir("run_dup", "snapshot_incomplete");
+  await mkdir(incomplete, { recursive: true });
+  await writeFile(path.join(incomplete, "checkpoint.tar.gz"), "partial download");
+  await service.deleteRun("run_dup");
+  await assert.rejects(access(incomplete), { code: "ENOENT" });
+  await access(path.join(service.restoreDir("run_dup", "snapshot_restore"), "restore.json"));
 });

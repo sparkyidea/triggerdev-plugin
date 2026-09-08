@@ -206,7 +206,8 @@ docker compose exec -e CHECKPOINT_SMOKE_CONFIRM=disposable-worker checkpoint \
 
 This creates a disposable Node HTTP process, checkpoints it through the real
 registry and S3, deletes the source, restores into a fresh container, and checks
-an in-memory UUID. It then injects an upload failure to verify same-process source
+an in-memory UUID. It verifies duplicate restore and metadata registration after
+a service restart, then injects a push failure to verify same-process source
 recovery. Only the Trigger completion callback is mocked, so this does not replace
 the real parent/child validation. Successful tests remove their own containers,
 object archives and image tags; failures leave artifacts for diagnosis.
@@ -218,6 +219,9 @@ object archives and image tags; failures leave artifacts for diagnosis.
 | `CHECKPOINT_STORAGE_DRIVER` | `local` | `local` for single-host testing or `s3` for a fleet |
 | `CHECKPOINT_ROOTFS_MODE` | `registry` | `registry` captures runtime filesystem changes; `none` is unsafe outside constrained tests |
 | `CHECKPOINT_MAX_CONCURRENT_JOBS` | `1` | Bounds CPU, disk, and network bursts per worker |
+| `CHECKPOINT_S3_UPLOAD_QUEUE_SIZE` | `4` | Concurrent S3 parts, integer 1–16; lower values trade throughput for buffering |
+| `CHECKPOINT_GZIP_LEVEL` | `6` | Gzip level, integer 1–9; level 1 trades archive size for compression speed |
+| `CHECKPOINT_METRICS_ENABLED` | `false` | Log stage timings, archive bytes and service CPU/RSS without manifests or environment |
 | `CHECKPOINT_REQUIRE_KERNEL_MATCH` | `false` | Enforce exact source/destination kernel string |
 | `CHECKPOINT_CONTROL_ALLOWED_HOST` | `supervisor` | Only this resolved container address may call mutating routes |
 | `CHECKPOINT_REAPER_GRACE_SECONDS` | `600` | Age before stopped `runner-*` containers are removed |
@@ -232,6 +236,35 @@ restores share one queue whose concurrency defaults to one operation per host.
 See `deploy/worker/orc-a1cpu1ram6/.env.example` in the deployment repo
 for the worker and storage settings. Registry and Trigger.dev credentials are reused from the
 normal worker configuration.
+
+
+### Lifecycle and resource tuning
+
+Job and restore records use **schema version 2**, with no migration of older
+state. Use fresh checkpoint state and new runs when testing this release.
+Duplicate restores verify the recorded full container ID and checkpoint identity
+before modifying files; live restore metadata survives checkpoint deletion and
+service restart. `/env` validates the owning container's current IP and labels,
+so Docker IP reuse cannot hand a new runner a previous run's identity.
+
+Explicit successful run deletion ends suspend deduplication and evicts its jobs.
+Active jobs and failed source recovery remain protected. Cleanup derives owned
+image names from the repository persisted at acceptance, and retains job records
+on image/storage deletion failure for retry on restart or a reaper pass. Live
+restore records remain until their container exits. State is bounded over repeated
+completed-and-deleted runs; runs not yet reclaimed by the platform are retained.
+
+Upload part size remains SDK-managed: 5 MiB for ordinary archives, increasing
+with known object length to stay within 10,000 parts. The service rejects files
+above the multipart protocol ceiling of 10,000 × 5 GiB; the configured S3-compatible
+server may impose a lower limit. See [S3 multipart limits](https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html).
+The nominal upload buffer budget is queue size × part size, not total process RSS.
+No whole-archive application buffer is introduced.
+
+The general defaults remain queue size 4 and gzip level 6 because synthetic
+measurements show throughput/size costs at lower settings. Tune with representative
+workloads. The packaged curl health probe avoids launching a second Node runtime;
+Compose must use the same probe. See [measurements and the host benchmark procedure](docs/resource-optimization.md).
 
 ## Security and limitations
 
@@ -255,7 +288,8 @@ normal worker configuration.
   attempts to restore the source process when a checkpoint job fails. If recovery
   fails, it never substitutes a normal container start: that loses the in-memory
   wait and can duplicate task effects. The failed job records `recoveryError` and
-  its source is excluded from automatic reaping until explicit run cleanup.
+  its source is excluded from automatic reaping and cleanup until recovery is
+  resolved.
   This is not a substitute for extensive failure testing.
 
 ## Development
@@ -263,7 +297,7 @@ normal worker configuration.
 ```bash
 cd services/checkpoint
 npm install
-npm test
+TMPDIR="$(realpath "${TMPDIR:-/tmp}")" npm test
 npm run check
 docker build -t trigger-checkpoint-service:test .
 ```

@@ -9,7 +9,7 @@ function required(name, env = process.env) {
 function integer(name, fallback, env = process.env) {
   const raw = env[name];
   if (raw === undefined || raw === "") return fallback;
-  const value = Number.parseInt(raw, 10);
+  const value = /^\d+$/.test(raw) ? Number(raw) : NaN;
   if (!Number.isSafeInteger(value) || value < 1) {
     throw new Error(`${name} must be a positive integer`);
   }
@@ -40,6 +40,8 @@ export function loadConfig(env = process.env) {
     port: integer("PORT", 8080, env),
     bodyLimitBytes: integer("CHECKPOINT_BODY_LIMIT_BYTES", 2 * 1024 * 1024, env),
     maxConcurrentJobs: integer("CHECKPOINT_MAX_CONCURRENT_JOBS", 1, env),
+    gzipLevel: boundedInteger("CHECKPOINT_GZIP_LEVEL", 6, 1, 9, env),
+    metricsEnabled: bool("CHECKPOINT_METRICS_ENABLED", false, env),
     checkpointRoot,
     dockerUrl: env.CHECKPOINT_DOCKER_URL || "http://docker-proxy:2375",
     dockerApiVersion: env.CHECKPOINT_DOCKER_API_VERSION || "",
@@ -53,6 +55,7 @@ export function loadConfig(env = process.env) {
       s3:
         storageDriver === "s3"
           ? {
+              uploadQueueSize: boundedInteger("CHECKPOINT_S3_UPLOAD_QUEUE_SIZE", 4, 1, 16, env),
               endpoint: required("CHECKPOINT_S3_ENDPOINT", env),
               region: env.CHECKPOINT_S3_REGION || "us-east-1",
               bucket: required("CHECKPOINT_S3_BUCKET", env),
@@ -92,4 +95,10 @@ export function loadConfig(env = process.env) {
   };
 
   return config;
+}
+
+function boundedInteger(name, fallback, min, max, env) {
+  const value = integer(name, fallback, env);
+  if (value < min || value > max) throw new Error(`${name} must be between ${min} and ${max}`);
+  return value;
 }

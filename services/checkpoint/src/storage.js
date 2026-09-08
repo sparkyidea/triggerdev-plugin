@@ -10,6 +10,9 @@ import {
 } from "@aws-sdk/client-s3";
 import { Upload } from "@aws-sdk/lib-storage";
 
+// S3 multipart protocol ceiling; individual compatible servers can impose less.
+const MAX_ARCHIVE_BYTES = 10_000 * 5 * 1024 ** 3;
+
 export function createStorage(config) {
   return config.driver === "s3" ? new S3Storage(config.s3) : new LocalStorage(config.localArchiveRoot);
 }
@@ -66,20 +69,37 @@ export class S3Storage {
     return `${this.config.prefix}/${runFriendlyId}/${snapshotFriendlyId}.tar.gz`;
   }
 
-  async putCheckpoint({ runFriendlyId, snapshotFriendlyId, archivePath }) {
+  async putCheckpoint({ runFriendlyId, snapshotFriendlyId, archivePath, signal }) {
     const key = this.key(runFriendlyId, snapshotFriendlyId);
     const file = await stat(archivePath);
+    if (!file.isFile() || file.size > MAX_ARCHIVE_BYTES) throw new Error("Checkpoint archive exceeds supported S3 file limits");
+    if (signal?.aborted) throw new Error("Checkpoint upload aborted");
+    const body = createReadStream(archivePath);
+    // Interrupt the input, not Upload's abort-controller race: done() must settle
+    // its requests/abort cleanup before the service can safely delete this run.
+    const abort = () => body.destroy(Object.assign(new Error("Checkpoint upload aborted"), { name: "AbortError" }));
     const upload = new Upload({
       client: this.client,
+      queueSize: this.config.uploadQueueSize ?? 4,
       params: {
         Bucket: this.config.bucket,
         Key: key,
-        Body: createReadStream(archivePath),
+        Body: body,
         ContentLength: file.size,
         ContentType: "application/gzip",
       },
     });
-    await upload.done();
+    const completion = upload.done();
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    try {
+      await completion;
+      if (signal?.aborted) throw new Error("Checkpoint upload aborted");
+    }
+    finally {
+      signal?.removeEventListener("abort", abort);
+      body.destroy();
+    }
     return `s3://${this.config.bucket}/${key}`;
   }
 
@@ -108,12 +128,13 @@ export class S3Storage {
       );
       const objects = (page.Contents || []).flatMap((item) => (item.Key ? [{ Key: item.Key }] : []));
       if (objects.length > 0) {
-        await this.client.send(
+        const result = await this.client.send(
           new DeleteObjectsCommand({
             Bucket: this.config.bucket,
             Delete: { Objects: objects, Quiet: true },
           })
         );
+        if (result.Errors?.length) throw new Error("S3 checkpoint deletion reported object failures");
       }
       continuationToken = page.IsTruncated ? page.NextContinuationToken : undefined;
     } while (continuationToken);

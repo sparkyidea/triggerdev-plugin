@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node src/index.js",
     "test": "node --test",
-    "check": "node --check src/index.js && node --check src/checkpoint-service.js && node --check src/docker.js && node --check src/queue.js && node --check src/server.js && node --check src/storage.js"
+    "check": "node --check src/index.js && node --check src/checkpoint-service.js && node --check src/docker.js && node --check src/queue.js && node --check src/server.js && node --check src/storage.js && node --check src/files.js && node --check src/metrics.js && node --check src/checkpoint-files.js"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "3.1127.0",

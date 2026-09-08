@@ -136,3 +136,12 @@ test("default-directory restore never sends checkpoint-dir, even as undefined", 
     "http://docker.test/containers/runner/start",
   ]);
 });
+
+test("image cleanup preserves conflicts for retry and never forces removal", async () => {
+  let url;
+  const client = new DockerClient({ baseUrl: "http://docker.test", fetchImpl: async (value) => {
+    url = value; return new Response("in use", { status: 409 });
+  } });
+  await assert.rejects(client.removeImage("registry.test/checkpoints:tag"), { status: 409 });
+  assert.match(url, /force=0$/);
+});
